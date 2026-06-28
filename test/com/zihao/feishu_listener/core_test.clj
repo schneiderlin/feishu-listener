@@ -249,6 +249,75 @@
                  :uuid "codex-agent-om_1"}]
                @replies))))))
 
+(deftest handle-codex-agent-message-sends-downloaded-image-to-codex
+  (testing "Feishu image messages are downloaded and forwarded as Codex image input"
+    (let [agent-messages (atom [])
+          resource-requests (atom [])
+          reply-target {:tenant-access-token "tenant-token"
+                        :request! (fn [request]
+                                    (swap! resource-requests conj request)
+                                    {:status 200
+                                     :headers {"content-type" "image/jpeg"}
+                                     :body (byte-array [(byte -1) (byte -40) (byte 1)])})}]
+      (with-redefs [codex-agent/handle-message!
+                    (fn [_service message _callbacks]
+                      (swap! agent-messages conj message)
+                      {:status :completed
+                       :reply-text "saw image"})]
+        (is (= {:status :completed
+                :reply-text "saw image"}
+               (sut/handle-codex-agent-message!
+                ::codex-agent
+                reply-target
+                {:message-id "om_img"
+                 :chat-id "oc_1"
+                 :message-type "image"
+                 :content {:image_key "img_v3_1"}})))
+        (is (= "https://open.feishu.cn/open-apis/im/v1/messages/om_img/resources/img_v3_1"
+               (:uri (first @resource-requests))))
+        (is (= {"type" "image"}
+               (:query-params (first @resource-requests))))
+        (let [content (:content (first @agent-messages))]
+          (is (= {:type :text
+                  :text "用户发送了一张图片。"}
+                 (first content)))
+          (is (= :image (:type (second content))))
+          (is (str/starts-with? (:url (second content))
+                                "data:image/jpeg;base64,")))))))
+
+(deftest handle-codex-agent-message-falls-back-to-text-when-image-download-fails
+  (testing "download failures are represented to Codex as a normal text message"
+    (let [agent-messages (atom [])
+          reply-target {:tenant-access-token "tenant-token"
+                        :request! (fn [_request]
+                                    {:status 403
+                                     :headers {"content-type" "application/json"}
+                                     :body (byte-array [])})}]
+      (with-redefs [codex-agent/handle-message!
+                    (fn [_service message _callbacks]
+                      (swap! agent-messages conj message)
+                      {:status :completed
+                       :reply-text "handled failure"})]
+        (is (= {:status :completed
+                :reply-text "handled failure"}
+               (sut/handle-codex-agent-message!
+                ::codex-agent
+                reply-target
+                {:message-id "om_img"
+                 :chat-id "oc_1"
+                 :message-type "image"
+                 :content {:image_key "img_v3_1"}})))
+        (let [content (:content (first @agent-messages))
+              text (:text (first content))]
+          (is (= 1 (count content)))
+          (is (= :text (:type (first content))))
+          (is (str/includes? text "用户发送了一张图片"))
+          (is (str/includes? text "下载图片内容失败"))
+          (is (str/includes? text "HTTP 403"))
+          (is (str/includes? text "om_img"))
+          (is (str/includes? text "img_v3_1"))
+          (is (not (str/includes? text "{\"image_key\""))))))))
+
 (deftest handle-codex-agent-message-replies-to-command-progress-events
   (testing "Feishu adapter turns coarse Codex command events into thread replies"
     (let [forwarded-events (atom [])

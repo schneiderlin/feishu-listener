@@ -2,7 +2,8 @@
   (:require
    [clojure.string :as str]
    [com.zihao.codex-agent.interface :as codex-agent]
-   [com.zihao.feishu-openapi-lite.interface :as feishu-lite]))
+   [com.zihao.feishu-openapi-lite.interface :as feishu-lite])
+  (:import [java.util Base64]))
 
 (def default-verification-token "")
 (def default-encrypt-key "")
@@ -12,6 +13,7 @@
 
 (declare reply-text!)
 (declare state)
+(declare target-api-client)
 
 (defn- blank->nil
   [value]
@@ -175,17 +177,127 @@
   [message]
   (or (blank->nil (get-in message [:content :text]))
       (blank->nil (get-in message [:message :content :text]))
-      (blank->nil (:content-raw message))
-      (blank->nil (get-in message [:message :content-raw]))))
+      (when-not (= "image" (:message-type message))
+        (or (blank->nil (:content-raw message))
+            (blank->nil (get-in message [:message :content-raw]))))))
+
+(defn- image-key
+  [message]
+  (or (blank->nil (get-in message [:content :image_key]))
+      (blank->nil (get-in message [:content :image-key]))
+      (blank->nil (get-in message [:message :content :image_key]))
+      (blank->nil (get-in message [:message :content :image-key]))))
+
+(defn- image-message?
+  [message]
+  (= "image" (:message-type message)))
+
+(defn- response-content-type->mime
+  [content-type]
+  (when-let [value (blank->nil content-type)]
+    (some-> value
+            (str/split #";")
+            first
+            str/trim)))
+
+(defn- bytes-mime
+  [bytes content-type]
+  (let [n (alength ^bytes bytes)]
+    (cond
+      (and (>= n 4)
+           (= (aget ^bytes bytes 0) (byte -119))
+           (= (aget ^bytes bytes 1) (byte 80))
+           (= (aget ^bytes bytes 2) (byte 78))
+           (= (aget ^bytes bytes 3) (byte 71)))
+      "image/png"
+
+      (and (>= n 2)
+           (= (aget ^bytes bytes 0) (byte -1))
+           (= (aget ^bytes bytes 1) (byte -40)))
+      "image/jpeg"
+
+      (and (>= n 4)
+           (= "GIF8" (String. ^bytes bytes 0 4 "US-ASCII")))
+      "image/gif"
+
+      :else
+      (or (response-content-type->mime content-type)
+          "application/octet-stream"))))
+
+(defn- data-url
+  [{:keys [bytes content-type]}]
+  (str "data:"
+       (bytes-mime bytes content-type)
+       ";base64,"
+       (.encodeToString (Base64/getEncoder) ^bytes bytes)))
+
+(defn- image-download-failure-reason
+  [throwable]
+  (let [data (ex-data throwable)]
+    (or (when-let [status (:status data)]
+          (str "HTTP " status))
+        (some-> (:type data) name)
+        (blank->nil (.getMessage throwable))
+        (some-> throwable class .getSimpleName))))
+
+(defn- image-download-fallback-text
+  [message throwable]
+  (str "用户发送了一张图片，但系统下载图片内容失败了。"
+       (when-let [message-id (feishu-message-id message)]
+         (str "\nFeishu message id: " message-id))
+       (when-let [key (image-key message)]
+         (str "\nFeishu image key: " key))
+       (when-let [reason (image-download-failure-reason throwable)]
+         (str "\n下载失败原因: " reason))
+       "\n请根据这个情况决定如何回应。"))
+
+(defn- missing-image-key-fallback-text
+  [message]
+  (str "用户发送了一张图片，但消息内容里没有可下载的 image_key。"
+       (when-let [message-id (feishu-message-id message)]
+         (str "\nFeishu message id: " message-id))
+       "\n请根据这个情况决定如何回应。"))
+
+(defn- text-codex-content
+  [message]
+  [{:type :text
+    :text (or (message-text message)
+              (when (image-message? message)
+                "用户发送了一张图片。")
+              "")}])
+
+(defn- image-codex-content!
+  [reply-target message]
+  (if-let [key (image-key message)]
+    (try
+      (let [api-client (target-api-client reply-target)
+            resource (feishu-lite/download-message-resource!
+                      api-client
+                      {:message-id (feishu-message-id message)
+                       :file-key key
+                       :type "image"})]
+        [{:type :text
+          :text "用户发送了一张图片。"}
+         {:type :image
+          :url (data-url resource)}])
+      (catch Throwable t
+        [{:type :text
+          :text (image-download-fallback-text message t)}]))
+    [{:type :text
+      :text (missing-image-key-fallback-text message)}]))
 
 (defn message->codex-agent-message
   [message]
-  (let [text (or (message-text message) "")]
-    {:channel :feishu
-     :external-session-id (feishu-external-session-id message)
-     :external-message-id (:message-id message)
-     :content [{:type :text
-                :text text}]}))
+  {:channel :feishu
+   :external-session-id (feishu-external-session-id message)
+   :external-message-id (:message-id message)
+   :content (text-codex-content message)})
+
+(defn- message->codex-agent-message!
+  [reply-target message]
+  (cond-> (message->codex-agent-message message)
+    (image-message? message)
+    (assoc :content (image-codex-content! reply-target message))))
 
 (defn- value-text
   [value]
@@ -309,7 +421,7 @@
   ([codex-agent-service reply-target message]
    (handle-codex-agent-message! codex-agent-service reply-target message {}))
   ([codex-agent-service reply-target message opts]
-   (let [agent-message (message->codex-agent-message message)
+   (let [agent-message (message->codex-agent-message! reply-target message)
          bootstrap-session? (nil? (feishu-thread-id message))
          reply-in-thread? (get opts :reply-in-thread? true)
          base-callbacks (or (:codex-agent-callbacks opts) {})

@@ -1,7 +1,8 @@
 (ns com.zihao.feishu-listener.core
   (:require
    [clojure.data.json :as json]
-   [clojure.string :as str])
+   [clojure.string :as str]
+   [com.zihao.codex-agent.interface :as codex-agent])
   (:import
    [com.lark.oapi Client]
    [com.lark.oapi.event EventDispatcher]
@@ -14,6 +15,8 @@
 (def default-encrypt-key "")
 
 (defrecord Listener [client api-client dispatcher config !state])
+
+(declare reply-text!)
 
 (defn- blank->nil
   [value]
@@ -238,6 +241,73 @@
       (blank->nil source) (.source source)
       true (.build))))
 
+(defn feishu-external-session-id
+  [message]
+  (or (blank->nil (:thread-id message))
+      (blank->nil (get-in message [:message :thread-id]))
+      (blank->nil (:chat-id message))
+      (blank->nil (get-in message [:message :chat-id]))
+      (throw (ex-info "Feishu message has no reusable session id"
+                      {:type :feishu-listener/missing-session-id
+                       :message-id (:message-id message)}))))
+
+(defn- message-text
+  [message]
+  (or (blank->nil (get-in message [:content :text]))
+      (blank->nil (get-in message [:message :content :text]))
+      (blank->nil (:content-raw message))
+      (blank->nil (get-in message [:message :content-raw]))))
+
+(defn message->codex-agent-message
+  [message]
+  (let [text (or (message-text message) "")]
+    {:channel :feishu
+     :external-session-id (feishu-external-session-id message)
+     :external-message-id (:message-id message)
+     :content [{:type :text
+                :text text}]}))
+
+(defn handle-codex-agent-message!
+  ([codex-agent-service reply-target message]
+   (handle-codex-agent-message! codex-agent-service reply-target message {}))
+  ([codex-agent-service reply-target message opts]
+   (let [agent-message (message->codex-agent-message message)
+         reply-in-thread? (get opts :reply-in-thread? true)
+         callbacks (merge (:codex-agent-callbacks opts)
+                          {:on-reply!
+                           (fn [{:keys [text]}]
+                             (reply-text! reply-target
+                                          (cond-> {:message-id (:message-id message)
+                                                   :text text
+                                                   :reply-in-thread? reply-in-thread?}
+                                            (:external-message-id agent-message)
+                                            (assoc :uuid (str "codex-agent-"
+                                                              (:external-message-id agent-message))))))})]
+     (codex-agent/handle-message! codex-agent-service agent-message callbacks))))
+
+(defn codex-agent-message-handler
+  ([codex-agent-service reply-target]
+   (codex-agent-message-handler codex-agent-service reply-target {}))
+  ([codex-agent-service reply-target opts]
+   (fn [message]
+     (handle-codex-agent-message! codex-agent-service reply-target message opts))))
+
+(defn- config-with-codex-agent-handler
+  [config reply-target]
+  (if-let [codex-agent-service (:codex-agent-service config)]
+    (let [existing-on-message (:on-message config)
+          handler (codex-agent-message-handler codex-agent-service
+                                               reply-target
+                                               (select-keys config
+                                                            [:reply-in-thread?
+                                                             :codex-agent-callbacks]))]
+      (assoc config
+             :on-message (fn [message]
+                           (when existing-on-message
+                             (existing-on-message message))
+                           (handler message))))
+    config))
+
 (defn make-listener
   "Build a Feishu WebSocket listener without opening the connection.
 
@@ -251,14 +321,16 @@
   Optional config:
   - :verification-token, :encrypt-key
   - :auto-reconnect?, :domain, :headers, :source
-  - :on-reconnecting, :on-reconnected, :on-error"
+  - :on-reconnecting, :on-reconnected, :on-error
+  - :codex-agent-service to route messages through Codex Agent"
   [config]
   (let [!state (atom {:started? false
                       :connection :new})
-        dispatcher (make-event-dispatcher config)
-        client (make-client config dispatcher !state)
-        api-client (make-api-client config)]
-    (->Listener client api-client dispatcher config !state)))
+        api-client (make-api-client config)
+        callback-config (config-with-codex-agent-handler config api-client)
+        dispatcher (make-event-dispatcher callback-config)
+        client (make-client config dispatcher !state)]
+    (->Listener client api-client dispatcher callback-config !state)))
 
 (defn start!
   [^Listener listener]

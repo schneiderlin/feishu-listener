@@ -36,6 +36,26 @@
   [event]
   (core/event->message event))
 
+(defn feishu-external-session-id
+  [message]
+  (core/feishu-external-session-id message))
+
+(defn message->codex-agent-message
+  [message]
+  (core/message->codex-agent-message message))
+
+(defn handle-codex-agent-message!
+  ([codex-agent-service reply-target message]
+   (core/handle-codex-agent-message! codex-agent-service reply-target message))
+  ([codex-agent-service reply-target message opts]
+   (core/handle-codex-agent-message! codex-agent-service reply-target message opts)))
+
+(defn codex-agent-message-handler
+  ([codex-agent-service reply-target]
+   (core/codex-agent-message-handler codex-agent-service reply-target))
+  ([codex-agent-service reply-target opts]
+   (core/codex-agent-message-handler codex-agent-service reply-target opts)))
+
 (defn send-text!
   [target opts]
   (core/send-text! target opts))

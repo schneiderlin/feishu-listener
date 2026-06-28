@@ -15,6 +15,13 @@ This launcher is the preferred setup path for development because it quickly
 creates an app + bot template with the right bot capability, event subscription,
 and permissions for message receiving.
 
+Feishu also provides an AI agent app launcher flow that preconfigures a broader
+set of bot, message, menu, document, and Slash Command permissions:
+
+```text
+https://open.feishu.cn/document/mcp_open_tools/integrating-agents-with-feishu/overview
+```
+
 After creating the app, copy its credentials into local environment variables:
 
 ```bash
@@ -59,3 +66,26 @@ The selected port is written to:
 (feishu/send-text! listener {:chat-id "oc_xxx" :text "hello"})
 (feishu/reply-text! listener {:message-id "om_xxx" :text "received"})
 ```
+
+## Codex Agent Routing
+
+Feishu can route received messages through Codex Agent without creating My Agent
+threads:
+
+```clojure
+(require '[com.zihao.codex-agent.interface :as codex-agent])
+
+(def agent
+  (codex-agent/start!
+    {:store-path "var/codex-agent/sessions.edn"
+     :codex-app-server {:codex-home "var/codex-agent/codex-home"}}))
+
+(def listener
+  (feishu/make-listener
+    {:app-id (System/getenv "FEISHU_APP_ID")
+     :app-secret (System/getenv "FEISHU_APP_SECRET")
+     :codex-agent-service agent}))
+```
+
+The adapter uses `thread-id` when Feishu supplies one, otherwise `chat-id`, as
+Codex Agent's external session id. Final replies are sent with `reply-text!`.

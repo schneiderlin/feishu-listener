@@ -2,6 +2,7 @@
   (:require
    [clojure.data.json :as json]
    [clojure.test :refer [deftest is testing]]
+   [com.zihao.codex-agent.interface :as codex-agent]
    [com.zihao.feishu-listener.core :as sut])
   (:import
    [com.lark.oapi.core.request EventReq]
@@ -215,3 +216,56 @@
            clojure.lang.ExceptionInfo
            #"Feishu API request failed"
            (sut/response->map resp))))))
+
+(deftest message->codex-agent-message-chooses-thread-or-chat-session
+  (testing "threaded Feishu messages use thread-id as the external session"
+    (is (= {:channel :feishu
+            :external-session-id "omt_1"
+            :external-message-id "om_1"
+            :content [{:type :text :text "hello"}]}
+           (sut/message->codex-agent-message
+            {:message-id "om_1"
+             :chat-id "oc_1"
+             :thread-id "omt_1"
+             :content {:text "hello"}}))))
+  (testing "non-thread messages fall back to chat-id"
+    (is (= "oc_1"
+           (:external-session-id
+            (sut/message->codex-agent-message
+             {:message-id "om_1"
+              :chat-id "oc_1"
+              :content {:text "hello"}}))))))
+
+(deftest handle-codex-agent-message-replies-through-feishu-callback
+  (testing "Feishu adapter calls Codex Agent and replies to the original message"
+    (let [agent-messages (atom [])
+          replies (atom [])]
+      (with-redefs [codex-agent/handle-message!
+                    (fn [_service message callbacks]
+                      (swap! agent-messages conj message)
+                      ((:on-reply! callbacks) {:text "answer"})
+                      {:status :completed
+                       :reply-text "answer"})
+                    sut/reply-text!
+                    (fn [_target opts]
+                      (swap! replies conj opts)
+                      {:ok? true})]
+        (is (= {:status :completed
+                :reply-text "answer"}
+               (sut/handle-codex-agent-message!
+                ::codex-agent
+                ::reply-target
+                {:message-id "om_1"
+                 :chat-id "oc_1"
+                 :content {:text "hello"}}
+                {:reply-in-thread? true})))
+        (is (= [{:channel :feishu
+                 :external-session-id "oc_1"
+                 :external-message-id "om_1"
+                 :content [{:type :text :text "hello"}]}]
+               @agent-messages))
+        (is (= [{:message-id "om_1"
+                 :text "answer"
+                 :reply-in-thread? true
+                 :uuid "codex-agent-om_1"}]
+               @replies))))))

@@ -78,7 +78,8 @@ threads:
 (def agent
   (codex-agent/start!
     {:store-path "var/codex-agent/sessions.edn"
-     :codex-app-server {:codex-home "var/codex-agent/codex-home"}}))
+     :codex-app-server {:model "gpt-5.5"
+                        :experimental-api? true}}))
 
 (def listener
   (feishu/make-listener
@@ -87,5 +88,18 @@ threads:
      :codex-agent-service agent}))
 ```
 
-The adapter uses `thread-id` when Feishu supplies one, otherwise `chat-id`, as
-Codex Agent's external session id. Final replies are sent with `reply-text!`.
+The adapter uses Feishu `thread-id` when Feishu supplies one. When a top-level
+message has no `thread-id`, it starts a new Codex thread with a bootstrap
+session id derived from the message id, such as `bootstrap:om_xxx`. The bot
+reply is sent with `reply-in-thread? true`; if Feishu returns a thread id for
+that reply, Codex Agent promotes the bootstrap session to the durable Feishu
+thread id. Later replies inside that Feishu thread reuse the same Codex thread.
+
+`chat-id` is only used by Feishu's API as the surrounding conversation target.
+It is not used as the Codex Agent session id.
+
+By default, Codex app-server uses the normal Codex home from the process
+environment, usually `~/.codex`. This is the expected local development setup
+because it reuses the existing Codex login/auth state. Only set
+`:codex-home` when that alternate directory already has valid Codex auth;
+otherwise Codex turns may fail with an OpenAI authentication error.

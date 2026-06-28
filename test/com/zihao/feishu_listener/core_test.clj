@@ -217,7 +217,7 @@
            #"Feishu API request failed"
            (sut/response->map resp))))))
 
-(deftest message->codex-agent-message-chooses-thread-or-chat-session
+(deftest message->codex-agent-message-chooses-thread-or-bootstrap-session
   (testing "threaded Feishu messages use thread-id as the external session"
     (is (= {:channel :feishu
             :external-session-id "omt_1"
@@ -228,8 +228,8 @@
              :chat-id "oc_1"
              :thread-id "omt_1"
              :content {:text "hello"}}))))
-  (testing "non-thread messages fall back to chat-id"
-    (is (= "oc_1"
+  (testing "non-thread messages use a bootstrap session from message-id"
+    (is (= "bootstrap:om_1"
            (:external-session-id
             (sut/message->codex-agent-message
              {:message-id "om_1"
@@ -249,7 +249,8 @@
                     sut/reply-text!
                     (fn [_target opts]
                       (swap! replies conj opts)
-                      {:ok? true})]
+                      {:ok? true
+                       :data {:thread-id "omt_1"}})]
         (is (= {:status :completed
                 :reply-text "answer"}
                (sut/handle-codex-agent-message!
@@ -260,7 +261,7 @@
                  :content {:text "hello"}}
                 {:reply-in-thread? true})))
         (is (= [{:channel :feishu
-                 :external-session-id "oc_1"
+                 :external-session-id "bootstrap:om_1"
                  :external-message-id "om_1"
                  :content [{:type :text :text "hello"}]}]
                @agent-messages))
@@ -269,3 +270,26 @@
                  :reply-in-thread? true
                  :uuid "codex-agent-om_1"}]
                @replies))))))
+
+(deftest handle-codex-agent-message-promotes-bootstrap-after-threaded-reply
+  (testing "top-level Feishu messages ask Codex Agent to promote to the created Feishu thread"
+    (let [callback-result (atom nil)]
+      (with-redefs [codex-agent/handle-message!
+                    (fn [_service _message callbacks]
+                      (reset! callback-result
+                              ((:on-reply! callbacks) {:text "answer"}))
+                      {:status :completed
+                       :reply-text "answer"})
+                    sut/reply-text!
+                    (fn [_target _opts]
+                      {:ok? true
+                       :data {:thread-id "omt_created"}})]
+        (sut/handle-codex-agent-message!
+         ::codex-agent
+         ::reply-target
+         {:message-id "om_1"
+          :chat-id "oc_1"
+          :content {:text "hello"}}
+         {:reply-in-thread? true})
+        (is (= "omt_created"
+               (:promote-external-session-id @callback-result)))))))

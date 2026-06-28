@@ -241,12 +241,25 @@
       (blank->nil source) (.source source)
       true (.build))))
 
-(defn feishu-external-session-id
+(defn- feishu-thread-id
   [message]
   (or (blank->nil (:thread-id message))
-      (blank->nil (get-in message [:message :thread-id]))
-      (blank->nil (:chat-id message))
-      (blank->nil (get-in message [:message :chat-id]))
+      (blank->nil (get-in message [:message :thread-id]))))
+
+(defn- feishu-message-id
+  [message]
+  (or (blank->nil (:message-id message))
+      (blank->nil (get-in message [:message :message-id]))))
+
+(defn- bootstrap-session-id
+  [message]
+  (when-let [message-id (feishu-message-id message)]
+    (str "bootstrap:" message-id)))
+
+(defn feishu-external-session-id
+  [message]
+  (or (feishu-thread-id message)
+      (bootstrap-session-id message)
       (throw (ex-info "Feishu message has no reusable session id"
                       {:type :feishu-listener/missing-session-id
                        :message-id (:message-id message)}))))
@@ -272,17 +285,24 @@
    (handle-codex-agent-message! codex-agent-service reply-target message {}))
   ([codex-agent-service reply-target message opts]
    (let [agent-message (message->codex-agent-message message)
+         bootstrap-session? (nil? (feishu-thread-id message))
          reply-in-thread? (get opts :reply-in-thread? true)
          callbacks (merge (:codex-agent-callbacks opts)
                           {:on-reply!
                            (fn [{:keys [text]}]
-                             (reply-text! reply-target
-                                          (cond-> {:message-id (:message-id message)
-                                                   :text text
-                                                   :reply-in-thread? reply-in-thread?}
-                                            (:external-message-id agent-message)
-                                            (assoc :uuid (str "codex-agent-"
-                                                              (:external-message-id agent-message))))))})]
+                             (let [reply-result
+                                   (reply-text! reply-target
+                                                (cond-> {:message-id (:message-id message)
+                                                         :text text
+                                                         :reply-in-thread? reply-in-thread?}
+                                                  (:external-message-id agent-message)
+                                                  (assoc :uuid (str "codex-agent-"
+                                                                    (:external-message-id agent-message)))))
+                                   reply-thread-id (get-in reply-result [:data :thread-id])]
+                               (cond-> {:feishu-response reply-result}
+                                 (and bootstrap-session?
+                                      (blank->nil reply-thread-id))
+                                 (assoc :promote-external-session-id reply-thread-id))))})]
      (codex-agent/handle-message! codex-agent-service agent-message callbacks))))
 
 (defn codex-agent-message-handler

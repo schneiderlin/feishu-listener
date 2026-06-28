@@ -1,5 +1,7 @@
 {:paths ["src" "resources"]
- :deps {poly/codex-agent {:local/root "../codex-agent"}
-        poly/feishu-openapi-lite {:local/root "../feishu-openapi-lite"}}
+ :deps {poly/codex-agent {:git/url "https://github.com/schneiderlin/codex-agent.git"
+                           :git/sha "866770cdabdef4b204ba0f306f8576090f8cabd3"}
+        poly/feishu-openapi-lite {:git/url "https://github.com/schneiderlin/feishu-openapi-lite.git"
+                                  :git/sha "e716ac9030a212325280b76fb8c4aca59dbc9dfd"}}
  :aliases {:test {:extra-paths ["test"]
                   :extra-deps {}}}}

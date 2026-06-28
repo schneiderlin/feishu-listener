@@ -1,7 +1,8 @@
 # feishu-listener
 
-Feishu app bot integration for receiving messages over the official Java SDK
-WebSocket client and sending text messages through the Feishu IM API.
+Feishu app bot integration for receiving messages over the repository's
+Babashka-compatible `feishu-openapi-lite` WebSocket client and sending text
+messages through the Feishu IM API.
 
 ## Quick App And Bot Setup
 

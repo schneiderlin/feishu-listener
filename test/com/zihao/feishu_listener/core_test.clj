@@ -1,5 +1,6 @@
 (ns com.zihao.feishu-listener.core-test
   (:require
+   [clojure.java.io :as io]
    [clojure.string :as str]
    [clojure.test :refer [deftest is testing]]
    [com.zihao.codex-agent.interface :as codex-agent]
@@ -243,11 +244,93 @@
                  :external-message-id "om_1"
                  :content [{:type :text :text "hello"}]}]
                @agent-messages))
-        (is (= [{:message-id "om_1"
-                 :text "answer"
-                 :reply-in-thread? true
-                 :uuid "codex-agent-om_1"}]
-               @replies))))))
+        (let [reply (first @replies)]
+          (is (= {:message-id "om_1"
+                  :text "answer"
+                  :reply-in-thread? true}
+                 (select-keys reply [:message-id :text :reply-in-thread?])))
+          (is (str/starts-with? (:uuid reply) "codex-msg-"))
+          (is (<= (count (:uuid reply)) 50)))))))
+
+(deftest listener-stop-command-interrupts-codex-session
+  (testing "/stop interrupts through Codex Agent instead of forwarding as user input"
+    (let [stop-messages (atom [])
+          replies (atom [])
+          raw-event (-> (sample-raw-event "p2p" "/stop")
+                        (assoc-in [:event :message :message_id] "om_stop")
+                        (assoc-in [:event :message :thread_id] "omt_1")
+                        (assoc-in [:event :message :root_id] "om_original"))]
+      (with-redefs [codex-agent/handle-message!
+                    (fn [& _]
+                      (throw (ex-info "stop must not become a Codex message" {})))
+                    codex-agent/stop-session!
+                    (fn [_service message]
+                      (swap! stop-messages conj message)
+                      (if (= "bootstrap:om_original" (:external-session-id message))
+                        {:interrupted? true
+                         :codex-thread-id "thread-1"
+                         :codex-turn-id "turn-1"}
+                        {:interrupted? false
+                         :reason :no-client}))
+                    sut/reply-text!
+                    (fn [_target opts]
+                      (swap! replies conj opts)
+                      {:ok? true
+                       :data {:thread-id "omt_1"}})]
+        (let [listener (sut/make-listener {:app-id "cli_1"
+                                           :app-secret "secret"
+                                           :codex-agent-service ::codex-agent
+                                           :reply-in-thread? true})]
+          (sut/dispatch-raw-event! listener (json/write-str raw-event))
+          (is (= ["omt_1" "bootstrap:om_original"]
+                 (mapv :external-session-id @stop-messages)))
+          (let [reply (first @replies)]
+            (is (= {:message-id "om_stop"
+                    :text "已请求停止当前 Codex 后端任务。"
+                    :reply-in-thread? true}
+                   (select-keys reply [:message-id :text :reply-in-thread?])))
+            (is (str/starts-with? (:uuid reply) "codex-stop-"))
+            (is (<= (count (:uuid reply)) 50))))))))
+
+(deftest listener-runs-codex-handler-without-blocking-stop-command
+  (testing "a long Codex turn does not block the Feishu dispatcher from receiving /stop"
+    (let [entered (promise)
+          release (promise)
+          stop-message (atom nil)
+          raw-message (-> (sample-raw-event "p2p" "start long task")
+                          (assoc-in [:event :message :message_id] "om_start")
+                          (assoc-in [:event :message :thread_id] "omt_1"))
+          raw-stop (-> (sample-raw-event "p2p" "/stop")
+                       (assoc-in [:event :message :message_id] "om_stop")
+                       (assoc-in [:event :message :thread_id] "omt_1"))]
+      (with-redefs [codex-agent/handle-message!
+                    (fn [_service message _callbacks]
+                      (deliver entered message)
+                      @release
+                      {:status :completed
+                       :reply-text "done"})
+                    codex-agent/stop-session!
+                    (fn [_service message]
+                      (reset! stop-message message)
+                      {:interrupted? true})
+                    sut/reply-text!
+                    (fn [_target _opts]
+                      {:ok? true
+                       :data {:thread-id "omt_1"}})]
+        (let [listener (sut/make-listener {:app-id "cli_1"
+                                           :app-secret "secret"
+                                           :codex-agent-service ::codex-agent
+                                           :reply-in-thread? true})]
+          (try
+            (let [dispatch-result (future
+                                    (sut/dispatch-raw-event! listener
+                                                             (json/write-str raw-message)))]
+              (is (some? (deref entered 1000 nil)))
+              (is (not= ::blocked (deref dispatch-result 100 ::blocked)))
+              (sut/dispatch-raw-event! listener (json/write-str raw-stop))
+              (is (= "omt_1" (:external-session-id @stop-message))))
+            (finally
+              (deliver release true))))))))
 
 (deftest handle-codex-agent-message-sends-downloaded-image-to-codex
   (testing "Feishu image messages are downloaded and forwarded as Codex image input"
@@ -285,6 +368,49 @@
           (is (str/starts-with? (:url (second content))
                                 "data:image/jpeg;base64,")))))))
 
+(deftest handle-codex-agent-message-sends-post-text-and-image-to-codex
+  (testing "Feishu rich post messages can include text and image in one message"
+    (let [agent-messages (atom [])
+          resource-requests (atom [])
+          reply-target {:tenant-access-token "tenant-token"
+                        :request! (fn [request]
+                                    (swap! resource-requests conj request)
+                                    {:status 200
+                                     :headers {"content-type" "image/jpeg"}
+                                     :body (byte-array [(byte -1) (byte -40) (byte 1)])})}]
+      (with-redefs [codex-agent/handle-message!
+                    (fn [_service message _callbacks]
+                      (swap! agent-messages conj message)
+                      {:status :completed
+                       :reply-text "saw post image"})]
+        (is (= {:status :completed
+                :reply-text "saw post image"}
+               (sut/handle-codex-agent-message!
+                ::codex-agent
+                reply-target
+                {:message-id "om_post"
+                 :chat-id "oc_1"
+                 :message-type "post"
+                 :content {:title ""
+                           :content [[{:tag "img"
+                                       :image_key "img_v3_post"
+                                       :width 654
+                                       :height 384}]
+                                     [{:tag "text"
+                                       :text "这个图里面有几个对话"
+                                       :style []}]]}})))
+        (is (= "https://open.feishu.cn/open-apis/im/v1/messages/om_post/resources/img_v3_post"
+               (:uri (first @resource-requests))))
+        (is (= {"type" "image"}
+               (:query-params (first @resource-requests))))
+        (let [content (:content (first @agent-messages))]
+          (is (= {:type :text
+                  :text "这个图里面有几个对话"}
+                 (first content)))
+          (is (= :image (:type (second content))))
+          (is (str/starts-with? (:url (second content))
+                                "data:image/jpeg;base64,")))))))
+
 (deftest handle-codex-agent-message-falls-back-to-text-when-image-download-fails
   (testing "download failures are represented to Codex as a normal text message"
     (let [agent-messages (atom [])
@@ -317,6 +443,214 @@
           (is (str/includes? text "om_img"))
           (is (str/includes? text "img_v3_1"))
           (is (not (str/includes? text "{\"image_key\""))))))))
+
+(deftest handle-codex-agent-message-downloads-file-to-local-attachment-path
+  (testing "Feishu file messages are downloaded and forwarded to Codex as a local path"
+    (let [agent-messages (atom [])
+          resource-requests (atom [])
+          attachment-dir (io/file "tmp"
+                                  "feishu-listener-file-tests"
+                                  (str (java.util.UUID/randomUUID)))
+          expected-file (io/file attachment-dir "om_file" "report.txt")
+          reply-target {:tenant-access-token "tenant-token"
+                        :request! (fn [request]
+                                    (swap! resource-requests conj request)
+                                    {:status 200
+                                     :headers {"content-type" "text/plain"}
+                                     :body (.getBytes "hello file" "UTF-8")})}]
+      (with-redefs [codex-agent/handle-message!
+                    (fn [_service message _callbacks]
+                      (swap! agent-messages conj message)
+                      {:status :completed
+                       :reply-text "saw file"})]
+        (is (= {:status :completed
+                :reply-text "saw file"}
+               (sut/handle-codex-agent-message!
+                ::codex-agent
+                reply-target
+                {:message-id "om_file"
+                 :chat-id "oc_1"
+                 :message-type "file"
+                 :content {:file_key "file_v2_1"
+                           :file_name "report.txt"}}
+                {:attachment-dir (.getPath attachment-dir)})))
+        (is (= "https://open.feishu.cn/open-apis/im/v1/messages/om_file/resources/file_v2_1"
+               (:uri (first @resource-requests))))
+        (is (= {"type" "file"}
+               (:query-params (first @resource-requests))))
+        (is (= "hello file" (slurp expected-file)))
+        (let [content (:content (first @agent-messages))
+              text (:text (first content))]
+          (is (= 1 (count content)))
+          (is (= :text (:type (first content))))
+          (is (str/includes? text (.getAbsolutePath expected-file)))
+          (is (str/includes? text "report.txt"))
+          (is (str/includes? text "send_feishu_file")))))))
+
+(deftest handle-codex-agent-message-exposes-file-upload-dynamic-tool
+  (testing "Codex can call a Feishu upload tool with a local path"
+    (let [upload-file (io/file "tmp"
+                               "feishu-listener-upload-tests"
+                               (str (java.util.UUID/randomUUID))
+                               "out.pdf")
+          _ (.mkdirs (.getParentFile upload-file))
+          _ (spit upload-file "pdf bytes")
+          requests (atom [])
+          callbacks-seen (atom nil)
+          tool-result (atom nil)
+          reply-target {:tenant-access-token "tenant-token"
+                        :request! (fn [request]
+                                    (swap! requests conj request)
+                                    (cond
+                                      (:multipart request)
+                                      {:status 200
+                                       :body (json/write-str
+                                              {:code 0
+                                               :msg "success"
+                                               :data {:file_key "file_uploaded"}})}
+
+                                      (str/ends-with? (:uri request) "/reply")
+                                      {:status 200
+                                       :body (json/write-str
+                                              {:code 0
+                                               :msg "success"
+                                               :data {:message_id "om_reply"
+                                                      :thread_id "omt_1"
+                                                      :msg_type "file"}})}))}]
+      (with-redefs [codex-agent/handle-message!
+                    (fn [_service _message callbacks]
+                      (reset! callbacks-seen callbacks)
+                      (reset! tool-result
+                              ((:on-dynamic-tool-call! callbacks)
+                               {:tool "send_feishu_file"
+                                :arguments {:path (.getPath upload-file)}}))
+                      {:status :completed
+                       :reply-text "done"})]
+        (sut/handle-codex-agent-message!
+         ::codex-agent
+         reply-target
+         {:message-id "om_1"
+          :chat-id "oc_1"
+          :content {:text "send the file"}}
+         {:reply-in-thread? true})
+        (is (= true (:experimental-api? @callbacks-seen)))
+        (is (= ["send_feishu_file"]
+               (mapv :name (:dynamic-tools @callbacks-seen))))
+        (is (= true (:success @tool-result)))
+        (is (str/includes? (get-in @tool-result [:content-items 0 :text])
+                           "file_uploaded"))
+        (let [upload-request (first @requests)
+              reply-request (second @requests)
+              reply-body (json/read-str (:body reply-request))]
+          (is (= "https://open.feishu.cn/open-apis/im/v1/files"
+                 (:uri upload-request)))
+          (is (= ["file_type" "file_name" "file"]
+                 (mapv :name (:multipart upload-request))))
+          (is (= "pdf" (get-in upload-request [:multipart 0 :content])))
+          (is (= "https://open.feishu.cn/open-apis/im/v1/messages/om_1/reply"
+                 (:uri reply-request)))
+          (is (= {:msg_type "file"
+                  :content "{\"file_key\":\"file_uploaded\"}"
+                  :reply_in_thread true}
+                 (select-keys reply-body [:msg_type :content :reply_in_thread])))
+          (is (str/starts-with? (:uuid reply-body) "codex-file-"))
+          (is (<= (count (:uuid reply-body)) 50)))))))
+
+(deftest handle-codex-agent-message-reports-file-upload-http-failure
+  (testing "failed file uploads report the Feishu HTTP phase and body to Codex"
+    (let [upload-file (io/file "tmp"
+                               "feishu-listener-upload-tests"
+                               (str (java.util.UUID/randomUUID))
+                               "out.md")
+          _ (.mkdirs (.getParentFile upload-file))
+          _ (spit upload-file "markdown bytes")
+          requests (atom [])
+          tool-result (atom nil)
+          reply-target {:tenant-access-token "tenant-token"
+                        :request! (fn [request]
+                                    (swap! requests conj request)
+                                    {:status 400
+                                     :body (json/write-str
+                                            {:code 234001
+                                             :msg "Invalid request param."})})}]
+      (with-redefs [codex-agent/handle-message!
+                    (fn [_service _message callbacks]
+                      (reset! tool-result
+                              ((:on-dynamic-tool-call! callbacks)
+                               {:tool "send_feishu_file"
+                                :arguments {:path (.getPath upload-file)
+                                            :file_name "category-theory-index.md"
+                                            :file_type "stream"}}))
+                      {:status :completed
+                       :reply-text "done"})]
+        (sut/handle-codex-agent-message!
+         ::codex-agent
+         reply-target
+         {:message-id "om_1"
+          :chat-id "oc_1"
+          :content {:text "send the file"}}
+         {:reply-in-thread? true})
+        (is (= false (:success @tool-result)))
+        (is (= 1 (count @requests)))
+        (let [text (get-in @tool-result [:content-items 0 :text])]
+          (is (str/includes? text "send_feishu_file failed during upload"))
+          (is (str/includes? text "HTTP status: 400"))
+          (is (str/includes? text "Invalid request param."))
+          (is (str/includes? text "file name: category-theory-index.md"))
+          (is (str/includes? text "file type: stream"))
+          (is (str/includes? text "Feishu message id: om_1"))
+          (is (not (str/includes? text "tenant-token"))))))))
+
+(deftest handle-codex-agent-message-reports-file-reply-http-failure
+  (testing "failed file replies report the reply phase and uploaded file key"
+    (let [upload-file (io/file "tmp"
+                               "feishu-listener-upload-tests"
+                               (str (java.util.UUID/randomUUID))
+                               "out.pdf")
+          _ (.mkdirs (.getParentFile upload-file))
+          _ (spit upload-file "pdf bytes")
+          requests (atom [])
+          tool-result (atom nil)
+          reply-target {:tenant-access-token "tenant-token"
+                        :request! (fn [request]
+                                    (swap! requests conj request)
+                                    (cond
+                                      (:multipart request)
+                                      {:status 200
+                                       :body (json/write-str
+                                              {:code 0
+                                               :msg "success"
+                                               :data {:file_key "file_uploaded"}})}
+
+                                      (str/ends-with? (:uri request) "/reply")
+                                      {:status 403
+                                       :body (json/write-str
+                                              {:code 99991663
+                                               :msg "permission denied"})}))}]
+      (with-redefs [codex-agent/handle-message!
+                    (fn [_service _message callbacks]
+                      (reset! tool-result
+                              ((:on-dynamic-tool-call! callbacks)
+                               {:tool "send_feishu_file"
+                                :arguments {:path (.getPath upload-file)}}))
+                      {:status :completed
+                       :reply-text "done"})]
+        (sut/handle-codex-agent-message!
+         ::codex-agent
+         reply-target
+         {:message-id "om_1"
+          :chat-id "oc_1"
+          :content {:text "send the file"}}
+         {:reply-in-thread? true})
+        (is (= false (:success @tool-result)))
+        (is (= 2 (count @requests)))
+        (let [text (get-in @tool-result [:content-items 0 :text])]
+          (is (str/includes? text "send_feishu_file failed during reply"))
+          (is (str/includes? text "HTTP status: 403"))
+          (is (str/includes? text "permission denied"))
+          (is (str/includes? text "file type: pdf"))
+          (is (str/includes? text "Feishu uploaded file key: file_uploaded"))
+          (is (not (str/includes? text "tenant-token"))))))))
 
 (deftest handle-codex-agent-message-replies-to-command-progress-events
   (testing "Feishu adapter turns coarse Codex command events into thread replies"
@@ -368,7 +702,8 @@
         (is (every? true? (map :reply-in-thread? @replies)))
         (is (every? #(str/starts-with? % "codex-agent-progress-")
                     (map :uuid (take 2 @replies))))
-        (is (= "codex-agent-om_1" (:uuid (last @replies))))))))
+        (is (str/starts-with? (:uuid (last @replies)) "codex-msg-"))
+        (is (<= (count (:uuid (last @replies))) 50))))))
 
 (deftest handle-codex-agent-message-promotes-bootstrap-after-threaded-reply
   (testing "top-level Feishu messages ask Codex Agent to promote to the created Feishu thread"

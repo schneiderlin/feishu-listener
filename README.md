@@ -99,6 +99,20 @@ thread id. Later replies inside that Feishu thread reuse the same Codex thread.
 `chat-id` is only used by Feishu's API as the surrounding conversation target.
 It is not used as the Codex Agent session id.
 
+File messages are downloaded from Feishu message resources and saved under
+`~/.feishu-codex-bridge/attachments` by default, or under `:attachment-dir` when
+configured. Codex receives a text input with the local absolute path instead of
+the file bytes.
+
+Outbound file replies use a Codex app-server dynamic tool named
+`send_feishu_file`. The model passes a local path, and the listener validates the
+path, uploads the file through Feishu OpenAPI, then replies in the current
+Feishu thread with `msg_type=file`. The tool uses Feishu's 30 MB upload limit.
+
+Sending `/stop` as a plain text Feishu message is treated as a bridge control
+command. It is not forwarded to Codex as user input; instead, the listener asks
+Codex app-server to interrupt the currently active turn for that Feishu session.
+
 By default, Codex app-server uses the normal Codex home from the process
 environment, usually `~/.codex`. This is the expected local development setup
 because it reuses the existing Codex login/auth state. Only set

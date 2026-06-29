@@ -65,3 +65,11 @@
    (core/reply-text! target message text))
   ([target opts]
    (core/reply-text! target opts)))
+
+(defn reply-file!
+  [target opts]
+  (core/reply-file! target opts))
+
+(defn upload-file!
+  [target opts]
+  (core/upload-file! target opts))

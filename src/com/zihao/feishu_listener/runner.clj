@@ -39,6 +39,12 @@
                 ".feishu-codex-bridge"
                 "sessions.edn")))
 
+(defn- default-attachment-dir
+  []
+  (str (io/file (System/getProperty "user.home")
+                ".feishu-codex-bridge"
+                "attachments")))
+
 (defn- codex-app-server-config
   []
   (cond-> {}
@@ -50,6 +56,8 @@
   (cond-> {:app-id (require-env! "FEISHU_APP_ID")
            :app-secret (require-env! "FEISHU_APP_SECRET")
            :codex-agent-service agent-service
+           :attachment-dir (or (env "FEISHU_CODEX_ATTACHMENT_DIR")
+                               (default-attachment-dir))
            :reply-in-thread? (env-bool "FEISHU_REPLY_IN_THREAD" true)
            :on-error (fn [{:keys [type throwable]}]
                        (binding [*out* *err*]
@@ -69,6 +77,7 @@
   (println)
   (println "Optional environment:")
   (println "  FEISHU_CODEX_STORE_PATH     default: ~/.feishu-codex-bridge/sessions.edn")
+  (println "  FEISHU_CODEX_ATTACHMENT_DIR default: ~/.feishu-codex-bridge/attachments")
   (println "  FEISHU_CONNECT_TIMEOUT_MS   default: 10000")
   (println "  FEISHU_REPLY_IN_THREAD      default: true")
   (println "  FEISHU_OPEN_BASE_URL")

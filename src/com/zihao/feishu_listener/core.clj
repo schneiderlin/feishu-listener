@@ -1000,6 +1000,18 @@
                          :message message
                          :throwable t})))))
 
+(defn- feishu-reply-response-summary
+  [response]
+  (cond-> (select-keys response [:ok? :code :message])
+    (:data response)
+    (assoc :data (select-keys (:data response)
+                              [:message-id
+                               :chat-id
+                               :thread-id
+                               :message-type
+                               :create-time
+                               :message-app-link]))))
+
 (defn handle-codex-agent-message!
   ([codex-agent-service reply-target message]
    (handle-codex-agent-message! codex-agent-service reply-target message {}))
@@ -1031,6 +1043,13 @@
                                                                "codex-msg-"
                                                                (:external-message-id agent-message)))))
                                   reply-thread-id (get-in reply-result [:data :thread-id])]
+                              (safe-callback!
+                               (:on-feishu-reply! base-callbacks)
+                               {:type :feishu-listener/reply-sent
+                                :message-id (:message-id message)
+                                :reply-in-thread? reply-in-thread?
+                                :reply-thread-id reply-thread-id
+                                :response (feishu-reply-response-summary reply-result)})
                               (cond-> {:feishu-response reply-result}
                                 (and bootstrap-session?
                                      (blank->nil reply-thread-id))

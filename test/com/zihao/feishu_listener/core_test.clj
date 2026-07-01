@@ -252,6 +252,47 @@
           (is (str/starts-with? (:uuid reply) "codex-msg-"))
           (is (<= (count (:uuid reply)) 50)))))))
 
+(deftest handle-codex-agent-message-reports-feishu-reply-summary
+  (testing "Feishu reply diagnostics expose delivery metadata without reply text"
+    (let [reply-events (atom [])]
+      (with-redefs [codex-agent/handle-message!
+                    (fn [_service _message callbacks]
+                      ((:on-reply! callbacks) {:text "secret reply text"})
+                      {:status :completed
+                       :reply-text "secret reply text"})
+                    sut/reply-text!
+                    (fn [_target _opts]
+                      {:ok? true
+                       :code 0
+                       :message "success"
+                       :data {:message-id "om_reply"
+                              :thread-id "omt_1"
+                              :message-type "text"
+                              :message-app-link "https://example.invalid/message"}})]
+        (sut/handle-codex-agent-message!
+         ::codex-agent
+         ::reply-target
+         {:message-id "om_1"
+          :chat-id "oc_1"
+          :content {:text "hello"}}
+         {:reply-in-thread? true
+          :codex-agent-callbacks {:on-feishu-reply!
+                                  #(swap! reply-events conj %)}})
+        (is (= [{:type :feishu-listener/reply-sent
+                 :message-id "om_1"
+                 :reply-in-thread? true
+                 :reply-thread-id "omt_1"
+                 :response {:ok? true
+                            :code 0
+                            :message "success"
+                            :data {:message-id "om_reply"
+                                   :thread-id "omt_1"
+                                   :message-type "text"
+                                   :message-app-link "https://example.invalid/message"}}}]
+               @reply-events))
+        (is (not (str/includes? (pr-str @reply-events)
+                                "secret reply text")))))))
+
 (deftest listener-stop-command-interrupts-codex-session
   (testing "/stop interrupts through Codex Agent instead of forwarding as user input"
     (let [stop-messages (atom [])
